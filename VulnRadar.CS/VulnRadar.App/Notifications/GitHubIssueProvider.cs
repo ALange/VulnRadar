@@ -1,5 +1,4 @@
 using System.Net.Http.Json;
-using System.Text;
 using System.Text.Json;
 using System.Text.RegularExpressions;
 using VulnRadar.Parsers;
@@ -117,148 +116,291 @@ public class GitHubIssueProvider : NotificationProvider
     private void AddComment(int issueNumber, string body)
     {
         var url = $"https://api.github.com/repos/{_repo}/issues/{issueNumber}/comments";
-        var response = _session.PostAsJsonAsync(url, new { body }).GetAwaiter().GetResult();
+        _session.PostAsJsonAsync(url, new { body }).GetAwaiter().GetResult()
+            .EnsureSuccessStatusCode();
+    }
+
+    private bool IssuesEnabled()
+    {
+        try
+        {
+            var r = _session.GetAsync($"https://api.github.com/repos/{_repo}").GetAwaiter().GetResult();
+            if (r.IsSuccessStatusCode)
+            {
+                var text = r.Content.ReadAsStringAsync().GetAwaiter().GetResult();
+                var doc = JsonDocument.Parse(text).RootElement;
+                if (doc.TryGetProperty("has_issues", out var hi))
+                    return hi.GetBoolean();
+            }
+        }
+        catch { /* ignore */ }
+        return true;
+    }
+
+    // ─── GitHub Projects v2 ───────────────────────────────────────────────────
+
+    /// <summary>Parse a GitHub Projects URL into owner/type/number.</summary>
+    public static (string Owner, string Type, int Number)? ParseProjectUrl(string projectUrl)
+    {
+        var userMatch = Regex.Match(projectUrl,
+            @"https?://github\.com/users/([^/]+)/projects/(\d+)");
+        if (userMatch.Success)
+            return (userMatch.Groups[1].Value, "user", int.Parse(userMatch.Groups[2].Value));
+
+        var orgMatch = Regex.Match(projectUrl,
+            @"https?://github\.com/orgs/([^/]+)/projects/(\d+)");
+        if (orgMatch.Success)
+            return (orgMatch.Groups[1].Value, "organization", int.Parse(orgMatch.Groups[2].Value));
+
+        return null;
+    }
+
+    private string? ResolveProjectId()
+    {
+        if (string.IsNullOrEmpty(_projectUrl)) return null;
+        if (_projectId != null) return _projectId;
+
+        var parsed = ParseProjectUrl(_projectUrl);
+        if (parsed == null)
+        {
+            Console.WriteLine($"⚠️ Invalid project URL format: {_projectUrl}");
+            return null;
+        }
+
+        var (owner, ownerType, number) = parsed.Value;
+
+        string query;
+        if (ownerType == "user")
+            query = "query($owner: String!, $number: Int!) { user(login: $owner) { projectV2(number: $number) { id title } } }";
+        else
+            query = "query($owner: String!, $number: Int!) { organization(login: $owner) { projectV2(number: $number) { id title } } }";
+
+        var payload = new { query, variables = new { owner, number } };
+        var response = _session.PostAsJsonAsync("https://api.github.com/graphql", payload)
+            .GetAwaiter().GetResult();
         response.EnsureSuccessStatusCode();
+
+        var text = response.Content.ReadAsStringAsync().GetAwaiter().GetResult();
+        var doc = JsonDocument.Parse(text).RootElement;
+
+        if (doc.TryGetProperty("errors", out var errs))
+        {
+            Console.WriteLine($"GraphQL error getting project: {errs}");
+            return null;
+        }
+
+        if (!doc.TryGetProperty("data", out var data)) return null;
+        var key = ownerType == "user" ? "user" : "organization";
+        if (!data.TryGetProperty(key, out var ownerEl)) return null;
+        if (!ownerEl.TryGetProperty("projectV2", out var project)) return null;
+        if (!project.TryGetProperty("id", out var idEl)) return null;
+        _projectId = idEl.GetString();
+        return _projectId;
+    }
+
+    private bool AddToProject(string contentNodeId)
+    {
+        var projectId = ResolveProjectId();
+        if (projectId == null) return false;
+
+        const string mutation = "mutation($projectId: ID!, $contentId: ID!) { addProjectV2ItemByContentId(input: {projectId: $projectId, contentId: $contentId}) { item { id } } }";
+        var payload = new { query = mutation, variables = new { projectId, contentId = contentNodeId } };
+        try
+        {
+            var response = _session.PostAsJsonAsync("https://api.github.com/graphql", payload)
+                .GetAwaiter().GetResult();
+            return response.IsSuccessStatusCode;
+        }
+        catch
+        {
+            return false;
+        }
     }
 
     // ─── Issue body formatting ────────────────────────────────────────────────
 
+    /// <summary>Generate a rich GitHub issue body for a CVE, matching the Python format.</summary>
     public static string FormatIssueBody(RadarItem item, List<Change>? changes = null)
     {
         var cveId = item.CveId;
-        var desc = item.Description;
-        var epss = CveParsers.FormatEpss(item.ProbabilityScore);
-        var cvss = CveParsers.FormatCvss(item.CvssScore);
+        var desc = (item.Description ?? "").Trim();
+        var epss = item.ProbabilityScore;
+        var cvss = item.CvssScore;
         var kev = item.ActiveThreat;
         var patch = item.InPatchthis;
-        var isCritical = item.IsCritical;
+        var watch = item.WatchlistHit;
 
-        var lines = new List<string>
-        {
-            $"## {(isCritical ? "🚨 CRITICAL" : "⚠️ ALERT")}: [{cveId}](https://www.cve.org/CVERecord?id={cveId})",
-            "",
-            "---",
-            "",
-            "### 📊 Risk Metrics",
-            "",
-            "| Metric | Value |",
-            "|--------|-------|",
-            $"| EPSS Score | {epss} |",
-            $"| CVSS Score | {cvss} |",
-            $"| CVSS Severity | {item.CvssSeverity ?? "N/A"} |",
-            $"| CISA KEV | {(kev ? "🔴 YES" : "⚪ No")} |",
-            $"| Exploit Intel (PatchThis) | {(patch ? "🟠 YES" : "⚪ No")} |",
-            $"| Priority | {(string.IsNullOrEmpty(item.PriorityLabel) ? "Standard" : item.PriorityLabel)} |",
-            "",
-            "---",
-            "",
-            "### 📝 Description",
-            "",
-            desc ?? "No description available.",
-            "",
-        };
+        var kevObj = item.Kev;
+        var kevDue = kevObj?.DueDate ?? "";
+        var kevVendor = kevObj?.VendorProject ?? "";
+        var kevProduct = kevObj?.Product ?? "";
+        var kevName = kevObj?.VulnerabilityName ?? "";
 
-        if (item.Kev != null)
-        {
-            lines.AddRange(new[]
-            {
-                "---", "",
-                "### ⚠️ CISA KEV Details", "",
-                $"- **Vulnerability Name:** {item.Kev.VulnerabilityName ?? "N/A"}",
-                $"- **Vendor/Project:** {item.Kev.VendorProject ?? "N/A"}",
-                $"- **Product:** {item.Kev.Product ?? "N/A"}",
-                $"- **Date Added:** {item.Kev.DateAdded ?? "N/A"}",
-                $"- **Required Action:** {item.Kev.RequiredAction ?? "N/A"}",
-                $"- **Due Date:** {item.Kev.DueDate ?? "N/A"}",
-                $"- **Ransomware Campaign:** {item.Kev.KnownRansomwareCampaignUse ?? "N/A"}",
-                "",
-            });
-        }
+        // Derive vendor/product: use first affected pair if available, fall back to KEV
+        var firstAffected = item.Affected.FirstOrDefault(a =>
+            !string.IsNullOrEmpty(a.Vendor) || !string.IsNullOrEmpty(a.Product));
+        var vendor = firstAffected?.Vendor ?? "";
+        var product = firstAffected?.Product ?? "";
 
-        if (item.MatchedTerms.Count > 0)
-        {
-            lines.AddRange(new[]
-            {
-                "---", "",
-                "### 🎯 Watchlist Matches", "",
-                string.Join(", ", item.MatchedTerms.Select(t => $"`{t}`")),
-                "",
-            });
-        }
+        static string Fmt(double? x, int digits) => x.HasValue
+            ? x.Value.ToString($"F{digits}", System.Globalization.CultureInfo.InvariantCulture) : "N/A";
+        static string FmtPct(double? x) => x.HasValue
+            ? $"{x.Value * 100.0:F1}%" : "N/A";
+
+        var lines = new List<string>();
 
         if (changes != null && changes.Count > 0)
         {
-            lines.AddRange(new[]
-            {
-                "---", "",
-                "### 🔄 Changes Detected", "",
-            });
+            lines.Add("## 🔔 Alert Reason");
+            lines.Add("");
             foreach (var c in changes)
-                lines.Add($"- {c}");
+                lines.Add($"> {c}");
             lines.Add("");
         }
 
-        lines.AddRange(new[]
+        lines.Add("## Overview");
+        lines.Add("");
+        lines.Add("| Field | Value |");
+        lines.Add("|-------|-------|");
+        lines.Add($"| **CVE ID** | [{cveId}](https://www.cve.org/CVERecord?id={cveId}) |");
+        lines.Add($"| **Vendor** | {(!string.IsNullOrEmpty(vendor) ? vendor : !string.IsNullOrEmpty(kevVendor) ? kevVendor : "Unknown")} |");
+        lines.Add($"| **Product** | {(!string.IsNullOrEmpty(product) ? product : !string.IsNullOrEmpty(kevProduct) ? kevProduct : "Unknown")} |");
+        lines.Add($"| **CVSS Score** | {Fmt(cvss, 1)} |");
+        lines.Add($"| **EPSS Score** | {FmtPct(epss)} |");
+        lines.Add("");
+
+        lines.Add("## ⚠️ Threat Signals");
+        lines.Add("");
+        lines.Add("| Signal | Status |");
+        lines.Add("|--------|--------|");
+        lines.Add($"| CISA KEV | {(kev ? "🔴 **YES** - Known Exploited" : "⚪ No")} |");
+        lines.Add($"| Exploit Intel | {(patch ? "🟠 **YES** - PoC Available" : "⚪ No")} |");
+        lines.Add($"| Watchlist Match | {(watch ? "🟡 **YES**" : "⚪ No")} |");
+        if (!string.IsNullOrEmpty(kevDue))
+            lines.Add($"| KEV Remediation Due | **{kevDue}** |");
+        lines.Add("");
+
+        lines.Add("## 📝 Description");
+        lines.Add("");
+        if (!string.IsNullOrEmpty(kevName))
         {
-            "---",
-            "",
-            "### 🔗 Resources",
-            "",
-            $"- [CVE Record](https://www.cve.org/CVERecord?id={cveId})",
-            $"- [NVD Entry](https://nvd.nist.gov/vuln/detail/{cveId})",
-            $"- [EPSS Info](https://www.first.org/epss/)",
-            $"- [CISA KEV](https://www.cisa.gov/known-exploited-vulnerabilities-catalog)",
-            "",
-            "---",
-            "_Generated by [VulnRadar](https://github.com/ALange/VulnRadar) (C# Edition)_",
-        });
+            lines.Add($"**{kevName}**");
+            lines.Add("");
+        }
+        lines.Add(!string.IsNullOrEmpty(desc) ? desc : "_No description available._");
+        lines.Add("");
+
+        if (item.Affected.Count > 0)
+        {
+            lines.Add("## 📦 Affected Components");
+            lines.Add("");
+            foreach (var aff in item.Affected.Take(10))
+            {
+                var parts = new List<string>();
+                if (!string.IsNullOrEmpty(aff.Vendor)) parts.Add($"vendor: {aff.Vendor}");
+                if (!string.IsNullOrEmpty(aff.Product)) parts.Add($"product: {aff.Product}");
+                if (parts.Count > 0) lines.Add($"- {string.Join(", ", parts)}");
+            }
+            if (item.Affected.Count > 10)
+                lines.Add($"- _...and {item.Affected.Count - 10} more_");
+            lines.Add("");
+        }
+
+        lines.Add("## 🔗 References");
+        lines.Add("");
+        lines.Add($"- [CVE.org Record](https://www.cve.org/CVERecord?id={cveId})");
+        lines.Add($"- [NVD Entry](https://nvd.nist.gov/vuln/detail/{cveId})");
+        if (kev)
+            lines.Add("- [CISA KEV Catalog](https://www.cisa.gov/known-exploited-vulnerabilities-catalog)");
+        lines.Add("");
+        lines.Add("---");
+        lines.Add("_Generated by [VulnRadar](https://github.com/ALange/VulnRadar)_");
 
         return string.Join("\n", lines);
     }
 
+    /// <summary>Generate a comment body for escalation events, matching the Python format.</summary>
     public static string FormatEscalationComment(Change change, RadarItem item)
     {
-        return change.ChangeType switch
+        var cveId = change.CveId;
+        var lines = new List<string> { "## ⚠️ Status Update", "" };
+
+        if (change.ChangeType == "NEW_KEV")
         {
-            "NEW_KEV" => $"## ⚠️ NOW IN CISA KEV\n\n**{item.CveId}** has been added to the CISA Known Exploited Vulnerabilities catalog.\n\n" +
-                (item.Kev?.DueDate != null ? $"**Action Required By:** {item.Kev.DueDate}\n\n" : "") +
-                (item.Kev?.RequiredAction != null ? $"**Required Action:** {item.Kev.RequiredAction}\n\n" : "") +
-                "_This CVE now requires immediate attention per CISA guidelines._",
-            "NEW_PATCHTHIS" => $"## 🔥 EXPLOIT INTEL AVAILABLE\n\n**{item.CveId}** now has a known PoC exploit in the PatchThis database.\n\n" +
-                $"**Current EPSS:** {CveParsers.FormatEpss(item.ProbabilityScore)}\n\n_Risk of exploitation has increased significantly._",
-            "EPSS_SPIKE" => $"## 📈 EPSS SCORE SPIKE\n\n**{item.CveId}** has seen a significant increase in EPSS probability.\n\n" +
-                $"**{change}**\n\n_Higher EPSS indicates increased likelihood of exploitation._",
-            "BECAME_CRITICAL" => $"## 🚨 NOW CRITICAL\n\n**{item.CveId}** has been elevated to critical status.\n\n" +
-                $"**Reason:** {(string.IsNullOrEmpty(item.PriorityLabel) ? "Multiple risk factors" : item.PriorityLabel)}",
-            _ => $"## ℹ️ Update\n\n{change}",
-        };
+            lines.AddRange(new[]
+            {
+                $"🚨 **{cveId} has been added to CISA KEV!**", "",
+                "This vulnerability is now confirmed to be actively exploited in the wild.", "",
+            });
+            var kev = item.Kev;
+            if (kev != null)
+            {
+                if (!string.IsNullOrEmpty(kev.DueDate))
+                    lines.Add($"**Remediation Due Date:** {kev.DueDate}");
+                lines.Add("");
+            }
+            lines.AddRange(new[]
+            {
+                "**Action Required:** Prioritize patching immediately.", "",
+                "[View CISA KEV Entry](https://www.cisa.gov/known-exploited-vulnerabilities-catalog)",
+            });
+        }
+        else if (change.ChangeType == "NEW_PATCHTHIS")
+        {
+            lines.AddRange(new[]
+            {
+                $"🔥 **{cveId} now has Exploit Intel (PoC Available)!**", "",
+                "A proof-of-concept or exploit code has been identified for this vulnerability.", "",
+                "**Action Required:** Increase priority - exploitation is now easier.",
+            });
+        }
+        else
+        {
+            lines.AddRange(new[]
+            {
+                $"📢 **{cveId} status has changed**", "",
+                $"Change type: {change.ChangeType}",
+            });
+        }
+
+        lines.AddRange(new[]
+        {
+            "", "---",
+            "_Escalation comment by [VulnRadar](https://github.com/ALange/VulnRadar)_",
+        });
+        return string.Join("\n", lines);
     }
 
+    /// <summary>Extract vendor/product labels from matched_terms, matching the Python format.</summary>
     public static List<string> ExtractDynamicLabels(RadarItem item, int maxLabels = 3)
     {
         var labels = new List<string>();
-        var severity = item.CvssSeverity?.ToLowerInvariant();
-        if (!string.IsNullOrEmpty(severity) && severity != "none")
-            labels.Add($"cvss-{severity}");
-        if (item.Nvd?.CweIds?.Count > 0)
-            labels.Add(item.Nvd.CweIds[0].ToLowerInvariant().Replace(" ", "-"));
-        return labels.Take(maxLabels).ToList();
+        foreach (var term in item.MatchedTerms)
+        {
+            if (string.IsNullOrWhiteSpace(term)) continue;
+            var clean = term.ToLowerInvariant().Trim().Replace(" ", "-");
+            if (clean.Length <= 50 && !labels.Contains(clean))
+                labels.Add(clean);
+            if (labels.Count >= maxLabels) break;
+        }
+        return labels;
     }
 
+    /// <summary>Extract severity label based on CVSS score, using colon format like Python.</summary>
     public static string? ExtractSeverityLabel(RadarItem item)
     {
         var cvss = item.CvssScore;
         if (!cvss.HasValue) return null;
         return cvss.Value switch
         {
-            >= 9.0 => "severity-critical",
-            >= 7.0 => "severity-high",
-            >= 4.0 => "severity-medium",
-            _ => "severity-low",
+            >= 9.0 => "severity:critical",
+            >= 7.0 => "severity:high",
+            >= 4.0 => "severity:medium",
+            _ => "severity:low",
         };
     }
 
-    // ─── NotificationProvider methods ────────────────────────────────────────
+    // ─── NotificationProvider interface methods ───────────────────────────────
 
     public override void SendAlert(RadarItem item, List<Change>? changes = null)
     {
@@ -270,7 +412,7 @@ public class GitHubIssueProvider : NotificationProvider
         string repo,
         Dictionary<string, (RadarItem Item, List<Change> Changes)>? changesByCve = null)
     {
-        // Weekly summary is separate
+        // Weekly summary is handled via CreateWeeklySummary
     }
 
     public override void SendBaseline(
@@ -318,16 +460,17 @@ public class GitHubIssueProvider : NotificationProvider
             "|--------|------|------|-----|-----------|-------------|",
         };
 
-        foreach (var item in sorted.Take(20))
+        foreach (var it in sorted.Take(20))
         {
-            var cveId = item.CveId;
-            var desc = (item.Description.Length > 60 ? item.Description[..60] : item.Description)
+            var cveId = it.CveId;
+            var rawDesc = it.Description ?? "";
+            var desc = (rawDesc.Length > 60 ? rawDesc[..60] : rawDesc)
                 .Replace("|", "\\|").Replace("\n", " ");
-            var kev = item.ActiveThreat ? "🔴" : "⚪";
-            var patch = item.InPatchthis ? "🟠" : "⚪";
+            var kevMark = it.ActiveThreat ? "🔴" : "⚪";
+            var patchMark = it.InPatchthis ? "🟠" : "⚪";
             lines.Add($"| [{cveId}](https://www.cve.org/CVERecord?id={cveId}) | " +
-                $"{CveParsers.FormatEpss(item.ProbabilityScore)} | " +
-                $"{CveParsers.FormatCvss(item.CvssScore)} | {kev} | {patch} | {desc}... |");
+                $"{CveParsers.FormatEpss(it.ProbabilityScore)} | " +
+                $"{CveParsers.FormatCvss(it.CvssScore)} | {kevMark} | {patchMark} | {desc}... |");
         }
 
         if (sorted.Count > 20)
@@ -342,7 +485,7 @@ public class GitHubIssueProvider : NotificationProvider
             "3. **Close this issue** once you've reviewed the baseline", "",
             "Future VulnRadar runs will only alert on **new or changed** CVEs.", "",
             "---",
-            "_Generated by [VulnRadar](https://github.com/ALange/VulnRadar) (C# Edition) - First Run Baseline_",
+            "_Generated by [VulnRadar](https://github.com/ALange/VulnRadar) - First Run Baseline_",
         });
 
         var body = string.Join("\n", lines);
@@ -351,7 +494,7 @@ public class GitHubIssueProvider : NotificationProvider
         Console.WriteLine($"Created baseline summary issue with {criticalCount} critical findings");
     }
 
-    /// <summary>Create a weekly summary issue.</summary>
+    /// <summary>Create a weekly summary issue, matching the Python format.</summary>
     public void CreateWeeklySummary(List<RadarItem> items, StateManager? state = null)
     {
         var now = DateTime.UtcNow;
@@ -370,12 +513,13 @@ public class GitHubIssueProvider : NotificationProvider
             foreach (var (_, firstSeen) in state.GetAllTracked())
             {
                 if (firstSeen == null) continue;
-                if (DateTime.TryParse(firstSeen, out var dt) && dt >= weekAgo)
+                if (DateTime.TryParse(firstSeen, out var fsdt) && fsdt >= weekAgo)
                     newCvesThisWeek++;
             }
         }
 
-        var criticalItems = items.Where(i => i.IsCritical)
+        var criticalItems = items
+            .Where(i => i.IsCritical)
             .OrderByDescending(i => i.ProbabilityScore ?? 0)
             .Take(10)
             .ToList();
@@ -399,16 +543,17 @@ public class GitHubIssueProvider : NotificationProvider
             "|--------|------|------|-----|---------|-------------|",
         };
 
-        foreach (var item in criticalItems)
+        foreach (var it in criticalItems)
         {
-            var cveId = item.CveId;
-            var desc = (item.Description.Length > 50 ? item.Description[..50] : item.Description)
+            var cveId = it.CveId;
+            var rawDesc = it.Description ?? "";
+            var desc = (rawDesc.Length > 50 ? rawDesc[..50] : rawDesc)
                 .Replace("|", "\\|").Replace("\n", " ");
-            var kev = item.ActiveThreat ? "🔴" : "⚪";
-            var patch = item.InPatchthis ? "🟠" : "⚪";
+            var kevMark = it.ActiveThreat ? "🔴" : "⚪";
+            var patchMark = it.InPatchthis ? "🟠" : "⚪";
             lines.Add($"| [{cveId}](https://www.cve.org/CVERecord?id={cveId}) | " +
-                $"{CveParsers.FormatEpss(item.ProbabilityScore)} | " +
-                $"{CveParsers.FormatCvss(item.CvssScore)} | {kev} | {patch} | {desc}... |");
+                $"{CveParsers.FormatEpss(it.ProbabilityScore)} | " +
+                $"{CveParsers.FormatCvss(it.CvssScore)} | {kevMark} | {patchMark} | {desc}... |");
         }
 
         lines.AddRange(new[]
@@ -419,7 +564,7 @@ public class GitHubIssueProvider : NotificationProvider
             "2. **Check for stale issues** - close resolved CVEs",
             "3. **Update watchlist** if you've added new tech to your stack", "",
             "---",
-            $"_Generated by [VulnRadar](https://github.com/ALange/VulnRadar) (C# Edition) | {now:yyyy-MM-dd HH:mm} UTC_",
+            $"_Generated by [VulnRadar](https://github.com/ALange/VulnRadar) | {now:yyyy-MM-dd HH:mm} UTC_",
         });
 
         var body = string.Join("\n", lines);
@@ -434,6 +579,12 @@ public class GitHubIssueProvider : NotificationProvider
         Dictionary<string, (RadarItem Item, List<Change> Changes)> changesByCve,
         bool dryRun = false)
     {
+        if (!IssuesEnabled())
+        {
+            Console.WriteLine("GitHub Issues are not enabled on this repository.");
+            return (0, 0);
+        }
+
         var existing = LoadExistingCves();
         var issueMap = LoadIssueMap();
         var created = 0;
@@ -441,34 +592,38 @@ public class GitHubIssueProvider : NotificationProvider
 
         var escalationTypes = new HashSet<string> { "NEW_KEV", "NEW_PATCHTHIS" };
 
+        // Handle escalation comments for existing issues
         foreach (var (cveId, (it, itemChanges)) in changesByCve)
         {
-            var escalationChanges = itemChanges.Where(c => escalationTypes.Contains(c.ChangeType)).ToList();
-            if (escalationChanges.Count > 0 && issueMap.TryGetValue(cveId, out var issueNum))
+            var escalationChanges = itemChanges
+                .Where(c => escalationTypes.Contains(c.ChangeType))
+                .ToList();
+            if (escalationChanges.Count == 0 || !issueMap.TryGetValue(cveId, out var issueNum))
+                continue;
+
+            foreach (var change in escalationChanges)
             {
-                foreach (var change in escalationChanges)
+                var commentBody = FormatEscalationComment(change, it);
+                if (dryRun)
                 {
-                    var commentBody = FormatEscalationComment(change, it);
-                    if (dryRun)
-                    {
-                        Console.WriteLine($"DRY RUN: would add escalation comment to #{issueNum} for {cveId}: {change.ChangeType}");
-                        escalated++;
-                        continue;
-                    }
-                    try
-                    {
-                        AddComment(issueNum, commentBody);
-                        Console.WriteLine($"Added escalation comment to #{issueNum} for {cveId}: {change.ChangeType}");
-                        escalated++;
-                    }
-                    catch (Exception ex)
-                    {
-                        Console.WriteLine($"Failed to add comment to #{issueNum}: {ex.Message}");
-                    }
+                    Console.WriteLine($"DRY RUN: would add escalation comment to #{issueNum} for {cveId}: {change.ChangeType}");
+                    escalated++;
+                    continue;
+                }
+                try
+                {
+                    AddComment(issueNum, commentBody);
+                    Console.WriteLine($"Added escalation comment to #{issueNum} for {cveId}: {change.ChangeType}");
+                    escalated++;
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"Failed to add comment to #{issueNum}: {ex.Message}");
                 }
             }
         }
 
+        // Create new issues
         foreach (var it in candidates)
         {
             if (created >= MaxAlerts) break;
@@ -497,10 +652,22 @@ public class GitHubIssueProvider : NotificationProvider
 
             try
             {
-                CreateIssue(title, body, labels);
+                var issueData = CreateIssue(title, body, labels);
                 Console.WriteLine($"Created issue for {cveId}");
                 existing.Add(cveId);
                 created++;
+
+                // Add to GitHub Projects v2 if configured
+                if (!string.IsNullOrEmpty(_projectUrl) && issueData.HasValue)
+                {
+                    var nodeId = issueData.Value.TryGetProperty("node_id", out var ni)
+                        ? ni.GetString() : null;
+                    if (!string.IsNullOrEmpty(nodeId))
+                    {
+                        if (AddToProject(nodeId!))
+                            Console.WriteLine("  → Added to project board");
+                    }
+                }
             }
             catch (Exception ex)
             {

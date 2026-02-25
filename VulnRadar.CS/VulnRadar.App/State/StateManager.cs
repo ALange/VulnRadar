@@ -22,7 +22,7 @@ public class Change
     };
 
     private static string FormatPct(double? val) =>
-        val.HasValue ? val.Value.ToString("P1") : "N/A";
+        val.HasValue ? $"{val.Value * 100.0:F1}%" : "N/A";
 }
 
 internal class StateData
