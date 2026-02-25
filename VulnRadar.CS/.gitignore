@@ -1,0 +1,11 @@
+# Build artifacts
+bin/
+obj/
+*.user
+*.suo
+.vs/
+*.nupkg
+
+# Test results
+TestResults/
+coverage.xml
