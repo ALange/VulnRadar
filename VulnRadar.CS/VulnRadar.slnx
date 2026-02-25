@@ -1,0 +1,4 @@
+<Solution>
+  <Project Path="VulnRadar.App/VulnRadar.App.csproj" />
+  <Project Path="VulnRadar.Tests/VulnRadar.Tests.csproj" />
+</Solution>

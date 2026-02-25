@@ -205,3 +205,9 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# C# / .NET build artifacts
+VulnRadar.CS/VulnRadar.App/bin/
+VulnRadar.CS/VulnRadar.App/obj/
+VulnRadar.CS/VulnRadar.Tests/bin/
+VulnRadar.CS/VulnRadar.Tests/obj/
